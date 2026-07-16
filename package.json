@@ -1,12 +1,13 @@
 {
-  "name": "space-arena-server",
-  "version": "1.0.0",
-  "description": "Servidor multijugador para Space Arena",
+  "name": "space-arena-ultra",
+  "version": "2.0.0",
+  "description": "Space Arena multijugador ultra expandido",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "express": "^4.18.2",
     "ws": "^8.14.2"
   },
   "engines": {
