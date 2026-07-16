@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Space Arena Ultra</title>
+  <style>
+    body { margin:0; background:#000; overflow:hidden; font-family:'Arial'; }
+    canvas { display:block; }
+    #ui {
+      position:absolute; top:10px; left:10px; color:white; font-size:14px; z-index:10;
+      pointer-events:none;
+    }
+    #health-bar { width:200px; height:15px; background:#333; border:1px solid white; }
+    #health-fill { height:100%; background:#0f0; }
+    #shield-bar { width:100%; height:4px; background:#0ff; margin-top:2px; }
+    #scoreboard {
+      position:absolute; top:10px; right:10px; background:rgba(0,0,0,0.7); color:white; padding:5px;
+      border-radius:5px; font-size:12px; max-height:300px; overflow-y:auto;
+    }
+    #chat {
+      position:absolute; bottom:40px; left:10px; width:300px; color:white; font-size:12px;
+      background:rgba(0,0,0,0.5); padding:3px; border-radius:3px;
+    }
+    #chat-input {
+      position:absolute; bottom:10px; left:10px; width:200px; background:rgba(0,0,0,0.8);
+      color:white; border:1px solid #555; padding:4px; display:none;
+    }
+    #weapon-select {
+      position:absolute; bottom:10px; right:10px; display:flex; gap:5px;
+    }
+    .weapon-btn {
+      background:rgba(255,255,255,0.2); border:1px solid white; color:white; padding:5px;
+      cursor:pointer; border-radius:3px;
+    }
+    .weapon-btn.active { background:rgba(255,255,0,0.5); }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <div id="ui">
+    <div>⚡ Vida</div>
+    <div id="health-bar"><div id="health-fill"></div><div id="shield-bar"></div></div>
+    <div id="powerups-indicator"></div>
+  </div>
+  <div id="scoreboard"></div>
+  <div id="chat"></div>
+  <input type="text" id="chat-input" placeholder="Escribe y Enter..." maxlength="50">
+  <div id="weapon-select">
+    <button class="weapon-btn active" data-weapon="laser">🔫 Láser</button>
+    <button class="weapon-btn" data-weapon="shotgun">🔫 Escopeta</button>
+    <button class="weapon-btn" data-weapon="rocket">🚀 Cohete</button>
+    <button class="weapon-btn" data-weapon="sniper">🔭 Sniper</button>
+    <button class="weapon-btn" data-weapon="mine">💣 Mina</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    const WS_URL = location.origin.replace(/^http/, 'ws'); // si se sirve desde el mismo servidor
+    // Si usás HTML separado, poné: 'wss://tu-servidor.onrender.com'
+
+    let myId = null;
+    let players = {};
+    let bullets = [], mines = [], powerUps = [], obstacles = [];
+    let chatMessages = [];
+    let worldSize = { w: 3000, h: 3000 };
+    let camera = { x: 0, y: 0 };
+
+    // Entrada
+    const keys = {};
+    let mouseAngle = 0, mouseDown = false, mouseWorldX = 0, mouseWorldY = 0;
+    let teleportKey = false;
+
+    window.addEventListener('keydown', e => {
+      keys[e.key.toLowerCase()] = true;
+      if (e.key === 'Enter') {
+        const input = document.getElementById('chat-input');
+        if (document.activeElement === input) {
+          // Enviar chat
+          const text = input.value.trim();
+          if (text) socket.send(JSON.stringify({ type:'chat', text }));
+          input.value = '';
+          input.style.display = 'none';
+        } else {
+          input.style.display = 'block';
+          input.focus();
+        }
+      }
+      if (e.key === 't') teleportKey = true; // teletransporte si tiene power
+    });
+    window.addEventListener('keyup', e => {
+      keys[e.key.toLowerCase()] = false;
+      if (e.key === 't') teleportKey = false;
+    });
+
+    canvas.addEventListener('mousemove', e => {
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left - canvas.width/2;
+      const my = e.clientY - rect.top - canvas.height/2;
+      mouseAngle = Math.atan2(my, mx);
+      mouseWorldX = e.clientX - rect.left + camera.x - canvas.width/2;
+      mouseWorldY = e.clientY - rect.top + camera.y - canvas.height/2;
+    });
+    canvas.addEventListener('mousedown', () => mouseDown = true);
+    canvas.addEventListener('mouseup', () => mouseDown = false);
+
+    // Selección de arma
+    document.querySelectorAll('.weapon-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelector('.weapon-btn.active').classList.remove('active');
+        btn.classList.add('active');
+        const weapon = btn.dataset.weapon;
+        socket.send(JSON.stringify({ type:'changeWeapon', weapon }));
+      });
+    });
+
+    let socket;
+    function connect() {
+      socket = new WebSocket(WS_URL);
+      socket.onopen = () => console.log('Conectado');
+      socket.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'init') {
+          myId = msg.id;
+          worldSize = msg.worldSize;
+        } else if (msg.type === 'gameState') {
+          players = {};
+          msg.players.forEach(p => players[p.id] = p);
+          bullets = msg.bullets || [];
+          mines = msg.mines || [];
+          powerUps = msg.powerUps || [];
+          obstacles = msg.obstacles || [];
+          if (msg.chatMessages) {
+            chatMessages = msg.chatMessages;
+            updateChat();
+          }
+          updateUI();
+        }
+      };
+      socket.onclose = () => setTimeout(connect, 3000);
+    }
+
+    function updateUI() {
+      const me = players[myId];
+      if (me) {
+        document.getElementById('health-fill').style.width = me.health + '%';
+        document.getElementById('health-fill').style.background = me.health > 60 ? '#0f0' : me.health > 30 ? '#ff0' : '#f00';
+        document.getElementById('shield-bar').style.width = (me.shield * 20) + '%';
+        // Potenciadores activos
+        const ind = document.getElementById('powerups-indicator');
+        ind.innerHTML = '';
+        if (me.speedBoost) ind.innerHTML += '⚡Velocidad ';
+        if (me.multishot) ind.innerHTML += '🔫Triple ';
+        if (me.laserBeam) ind.innerHTML += '🔆Láser ';
+        if (me.invisible) ind.innerHTML += '👻Invis ';
+      }
+      // Tabla de clasificación
+      let scoreHTML = '<b>🏆 Clasificación</b><br>';
+      const sorted = Object.values(players).sort((a,b) => (b.score||0) - (a.score||0)).slice(0,10);
+      sorted.forEach(p => {
+        scoreHTML += `<div style="color:${p.color}">${p.name}: ${p.score||0} pts ${p.alive ? '' : '💀'}</div>`;
+      });
+      document.getElementById('scoreboard').innerHTML = scoreHTML;
+    }
+
+    function updateChat() {
+      const chatDiv = document.getElementById('chat');
+      chatDiv.innerHTML = chatMessages.map(m => `<div><b>${m.name}:</b> ${m.text}</div>`).join('');
+    }
+
+    setInterval(() => {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      socket.send(JSON.stringify({
+        type: 'input',
+        keys,
+        mouseAngle,
+        shoot: mouseDown,
+        teleport: teleportKey,
+        mouseWorldX,
+        mouseWorldY
+      }));
+    }, 1000/60);
+
+    // Renderizado
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      const me = players[myId];
+      if (me) {
+        camera.x = me.x - canvas.width/2;
+        camera.y = me.y - canvas.height/2;
+      }
+      ctx.save();
+      ctx.translate(-camera.x, -camera.y);
+
+      // Fondo estrellado
+      ctx.fillStyle = '#000';
+      ctx.fillRect(-worldSize.w/2, -worldSize.h/2, worldSize.w, worldSize.h);
+      for (let i = 0; i < 200; i++) {
+        const sx = (i * 137.5) % worldSize.w - worldSize.w/2;
+        const sy = (i * 263.7) % worldSize.h - worldSize.h/2;
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(sx, sy, 1, 1);
+      }
+
+      // Obstáculos
+      obstacles.forEach(o => {
+        if (o.type === 'asteroid') {
+          ctx.fillStyle = '#888';
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.radius, 0, Math.PI*2);
+          ctx.fill();
+        } else if (o.type === 'blackhole') {
+          ctx.fillStyle = '#400';
+          ctx.beginPath();
+          ctx.arc(o.x, o.y, o.radius, 0, Math.PI*2);
+          ctx.fill();
+          ctx.strokeStyle = '#f00';
+          ctx.stroke();
+        }
+      });
+
+      // PowerUps
+      powerUps.forEach(p => {
+        ctx.fillStyle = p.type === 'speed' ? '#ff0' : p.type === 'multishot' ? '#f0f' : p.type === 'shield' ? '#0ff' : '#fff';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 12, 0, Math.PI*2);
+        ctx.fill();
+      });
+
+      // Minas
+      mines.forEach(m => {
+        ctx.fillStyle = '#f00';
+        ctx.beginPath();
+        ctx.arc(m.x, m.y, 6, 0, Math.PI*2);
+        ctx.fill();
+      });
+
+      // Balas
+      bullets.forEach(b => {
+        ctx.fillStyle = '#ff0';
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 3, 0, Math.PI*2);
+        ctx.fill();
+      });
+
+      // Jugadores
+      for (const id in players) {
+        const p = players[id];
+        if (!p.alive) continue;
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.angle);
+        if (p.invisible && id != myId) {
+          ctx.globalAlpha = 0.3;
+        }
+        // Nave
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.moveTo(20, 0);
+        ctx.lineTo(-15, -12);
+        ctx.lineTo(-15, 12);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+        if (p.shield > 0) {
+          ctx.strokeStyle = '#0ff';
+          ctx.beginPath();
+          ctx.arc(0, 0, 22, 0, Math.PI*2);
+          ctx.stroke();
+        }
+        if (id == myId && p.weapon) {
+          ctx.fillStyle = '#fff';
+          ctx.font = '10px Arial';
+          ctx.fillText(p.weapon, -10, 25);
+        }
+        ctx.restore();
+      }
+
+      ctx.restore();
+      requestAnimationFrame(draw);
+    }
+
+    connect();
+    draw();
+    window.addEventListener('resize', () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    });
+  </script>
+</body>
+</html>
