@@ -1,183 +1,235 @@
+const express = require('express');
+const http = require('http');
 const WebSocket = require('ws');
+const path = require('path');
 
-const WORLD_WIDTH = 2000;
-const WORLD_HEIGHT = 2000;
-const TICK_RATE = 1000 / 60; // 60 FPS
-const BULLET_SPEED = 8;
-const PLAYER_SPEED = 4;
-const MAX_PLAYERS = 10;
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-let players = new Map(); // ws -> { id, x, y, angle, health, color, shield, fireRate, lastShot, alive }
+// Servir archivos estáticos desde la carpeta 'public' (ahí pondremos el HTML)
+app.use(express.static('public'));
+
+// Constantes del juego
+const WORLD_W = 3000, WORLD_H = 3000;
+const TICK = 1000 / 60;
+const MAX_PLAYERS = 20;
+
+// Almacenamiento
+let players = new Map(); // ws -> player
 let bullets = [];
 let powerUps = [];
+let mines = [];
+let obstacles = [];
+let flags = { red: null, blue: null }; // Para CTF
+let gameMode = 'deathmatch'; // 'deathmatch', 'ctf', 'king', 'survival'
 let nextId = 1;
 
-// Potenciadores iniciales
-for (let i = 0; i < 10; i++) {
-  spawnPowerUp();
-}
-
-function spawnPowerUp() {
-  const types = ['speed', 'multishot', 'shield'];
-  const type = types[Math.floor(Math.random() * types.length)];
-  powerUps.push({
-    id: Math.random().toString(36).substr(2, 6),
-    x: Math.random() * WORLD_WIDTH - WORLD_WIDTH/2,
-    y: Math.random() * WORLD_HEIGHT - WORLD_HEIGHT/2,
-    type,
-    radius: 15
+// Inicializar obstáculos
+for (let i = 0; i < 15; i++) {
+  obstacles.push({
+    id: i,
+    x: Math.random() * WORLD_W - WORLD_W/2,
+    y: Math.random() * WORLD_H - WORLD_H/2,
+    radius: 30 + Math.random() * 50,
+    type: Math.random() < 0.3 ? 'blackhole' : 'asteroid',
+    angle: Math.random() * Math.PI * 2,
+    speed: 0.5 + Math.random()
   });
 }
 
-// Lógica de colisiones y físicas simple
+// Potenciadores
+for (let i = 0; i < 20; i++) spawnPowerUp();
+
+function spawnPowerUp() {
+  const types = ['speed', 'multishot', 'shield', 'laser', 'health', 'invis', 'teleport', 'mine'];
+  const type = types[Math.floor(Math.random() * types.length)];
+  powerUps.push({
+    id: Math.random().toString(36).substr(2,6),
+    x: Math.random() * WORLD_W - WORLD_W/2,
+    y: Math.random() * WORLD_H - WORLD_H/2,
+    type
+  });
+}
+
+// Chat
+let chatMessages = [];
+
+// Lógica del juego
 function update() {
-  // Mover jugadores (reciben input del cliente)
-  // Mover balas
-  for (let i = bullets.length - 1; i >= 0; i--) {
-    const b = bullets[i];
-    b.x += Math.cos(b.angle) * BULLET_SPEED;
-    b.y += Math.sin(b.angle) * BULLET_SPEED;
-    // Eliminar si sale del mundo
-    if (Math.abs(b.x) > WORLD_WIDTH/2 || Math.abs(b.y) > WORLD_HEIGHT/2) {
-      bullets.splice(i, 1);
-      continue;
-    }
-    // Colisión con jugadores
-    for (let [ws, player] of players) {
-      if (player.alive && player.id !== b.ownerId) {
-        const dx = player.x - b.x;
-        const dy = player.y - b.y;
-        const dist = Math.sqrt(dx*dx + dy*dy);
-        if (dist < 20) { // radio de colisión
-          if (player.shield > 0) {
-            player.shield--;
-          } else {
-            player.health -= 10;
-            if (player.health <= 0) {
-              player.alive = false;
-              player.health = 0;
-              broadcast({ type: 'playerDied', id: player.id, killerId: b.ownerId });
-            }
-          }
-          bullets.splice(i, 1);
-          break;
+  // Mover obstáculos
+  obstacles.forEach(o => {
+    if (o.type === 'asteroid') {
+      o.x += Math.cos(o.angle) * o.speed;
+      o.y += Math.sin(o.angle) * o.speed;
+      if (Math.abs(o.x) > WORLD_W/2 || Math.abs(o.y) > WORLD_H/2) o.angle += Math.PI;
+    } else if (o.type === 'blackhole') {
+      // Atraer jugadores cercanos
+      for (let [ws, p] of players) {
+        if (!p.alive) continue;
+        const dx = o.x - p.x, dy = o.y - p.y;
+        const dist = Math.sqrt(dx*dx+dy*dy);
+        if (dist < 200) {
+          p.x += dx / dist * 0.8;
+          p.y += dy / dist * 0.8;
         }
       }
     }
+  });
+
+  // Balas
+  for (let i = bullets.length-1; i >=0; i--) {
+    const b = bullets[i];
+    b.x += Math.cos(b.angle) * b.speed;
+    b.y += Math.sin(b.angle) * b.speed;
+    if (Math.abs(b.x) > WORLD_W/2 || Math.abs(b.y) > WORLD_H/2) {
+      bullets.splice(i,1);
+      continue;
+    }
+    // Colisión con jugadores
+    for (let [ws, p] of players) {
+      if (!p.alive || p.id === b.ownerId) continue;
+      if (p.invisible) continue;
+      const dx = p.x - b.x, dy = p.y - b.y;
+      if (Math.sqrt(dx*dx+dy*dy) < 18) {
+        if (p.shield > 0) { p.shield--; }
+        else {
+          p.health -= b.damage;
+          if (p.health <= 0) {
+            p.health = 0;
+            p.alive = false;
+            p.deathTimer = 180;
+            // Dar puntos al que mató
+            const killer = getPlayerById(b.ownerId);
+            if (killer) killer.score = (killer.score||0) + 100;
+          }
+        }
+        bullets.splice(i,1);
+        break;
+      }
+    }
   }
-  // Potenciadores: recoger
-  for (let [ws, player] of players) {
-    if (!player.alive) continue;
-    for (let i = powerUps.length - 1; i >= 0; i--) {
-      const p = powerUps[i];
-      const dx = player.x - p.x;
-      const dy = player.y - p.y;
-      if (Math.sqrt(dx*dx + dy*dy) < 30) {
-        applyPowerUp(player, p.type);
-        powerUps.splice(i, 1);
-        spawnPowerUp(); // mantener 10 siempre
+
+  // Minas
+  mines.forEach(m => {
+    for (let [ws, p] of players) {
+      if (!p.alive || p.id === m.ownerId) continue;
+      if (p.invisible) continue;
+      const dx = p.x - m.x, dy = p.y - m.y;
+      if (Math.sqrt(dx*dx+dy*dy) < 30) {
+        // Explosión
+        p.health -= 30;
+        if (p.health <= 0) {
+          p.alive = false;
+          p.deathTimer = 180;
+          const killer = getPlayerById(m.ownerId);
+          if (killer) killer.score = (killer.score||0) + 50;
+        }
+        // Remover mina
+        mines = mines.filter(m2 => m2.id !== m.id);
+        // Efecto de área (daño a otros)
+        for (let [ws2, p2] of players) {
+          if (p2.id !== p.id && p2.alive && !p2.invisible) {
+            const dx2 = p2.x - m.x, dy2 = p2.y - m.y;
+            if (Math.sqrt(dx2*dx2+dy2*dy2) < 80) p2.health -= 15;
+          }
+        }
+        break;
+      }
+    }
+  });
+
+  // PowerUps
+  for (let [ws, p] of players) {
+    if (!p.alive) continue;
+    for (let i = powerUps.length-1; i>=0; i--) {
+      const pu = powerUps[i];
+      const dx = p.x - pu.x, dy = p.y - pu.y;
+      if (Math.sqrt(dx*dx+dy*dy) < 25) {
+        applyPowerUp(p, pu.type);
+        powerUps.splice(i,1);
+        spawnPowerUp();
+      }
+    }
+  }
+
+  // Reapariciones
+  for (let [ws, p] of players) {
+    if (!p.alive) {
+      p.deathTimer--;
+      if (p.deathTimer <= 0) respawn(p);
+    }
+    // Recargar escudo
+    if (p.alive && p.shield < p.maxShield) {
+      p.shieldRecharge = (p.shieldRecharge || 0) + 1;
+      if (p.shieldRecharge >= 120) { // 2 segundos
+        p.shield = Math.min(p.shield+1, p.maxShield);
+        p.shieldRecharge = 0;
       }
     }
   }
 }
 
-function applyPowerUp(player, type) {
-  switch (type) {
-    case 'speed':
-      player.speedBoost = 300; // 5 segundos a 60fps
-      break;
-    case 'multishot':
-      player.multishot = 300;
-      break;
-    case 'shield':
-      player.shield = Math.min(player.shield + 3, 5);
-      break;
+function applyPowerUp(p, type) {
+  switch(type) {
+    case 'speed': p.speedBoost = 300; break;
+    case 'multishot': p.multishot = 300; break;
+    case 'shield': p.shield = Math.min(p.shield+3, 5); break;
+    case 'laser': p.laserBeam = 180; break;
+    case 'health': p.health = Math.min(p.health+30, 100); break;
+    case 'invis': p.invisible = 240; break;
+    case 'teleport': p.teleport = true; break;
+    case 'mine': p.mines = (p.mines||0) + 2; break;
   }
 }
 
-function handlePlayerInput(ws, input) {
-  const player = players.get(ws);
-  if (!player || !player.alive) return;
-  // input: { keys: { w, a, s, d }, mouseAngle }
-  const speed = PLAYER_SPEED + (player.speedBoost > 0 ? 3 : 0);
-  if (input.keys.w) player.y -= speed;
-  if (input.keys.s) player.y += speed;
-  if (input.keys.a) player.x -= speed;
-  if (input.keys.d) player.x += speed;
-  // Limitar mundo
-  player.x = Math.max(-WORLD_WIDTH/2, Math.min(WORLD_WIDTH/2, player.x));
-  player.y = Math.max(-WORLD_HEIGHT/2, Math.min(WORLD_HEIGHT/2, player.y));
-  if (input.mouseAngle !== undefined) {
-    player.angle = input.mouseAngle;
-  }
-  // Disparo
-  if (input.shoot && Date.now() - player.lastShot > (player.multishot > 0 ? 100 : 200)) {
-    player.lastShot = Date.now();
-    const bullet = {
-      id: Math.random().toString(36).substr(2, 6),
-      x: player.x,
-      y: player.y,
-      angle: player.angle,
-      ownerId: player.id
-    };
-    bullets.push(bullet);
-    if (player.multishot > 0) {
-      // dos balas extra
-      bullets.push({ ...bullet, angle: player.angle + 0.15, id: Math.random().toString(36).substr(2,6) });
-      bullets.push({ ...bullet, angle: player.angle - 0.15, id: Math.random().toString(36).substr(2,6) });
-    }
-  }
-  // Reducir boosts
-  if (player.speedBoost > 0) player.speedBoost--;
-  if (player.multishot > 0) player.multishot--;
+function respawn(p) {
+  p.x = (Math.random() - 0.5) * WORLD_W * 0.7;
+  p.y = (Math.random() - 0.5) * WORLD_H * 0.7;
+  p.health = 100;
+  p.shield = 0;
+  p.alive = true;
+  p.deathTimer = 0;
+  p.invisible = 0;
+  p.speedBoost = 0;
+  p.multishot = 0;
+  p.laserBeam = 0;
+  p.teleport = false;
+  p.invulnerable = 120; // 2 seg invulnerable
 }
 
-// Respawnear jugador
-function respawnPlayer(player) {
-  player.x = (Math.random() - 0.5) * WORLD_WIDTH * 0.8;
-  player.y = (Math.random() - 0.5) * WORLD_HEIGHT * 0.8;
-  player.health = 100;
-  player.shield = 0;
-  player.alive = true;
-  player.speedBoost = 0;
-  player.multishot = 0;
+function getPlayerById(id) {
+  for (let [ws, p] of players) if (p.id === id) return p;
+  return null;
 }
-
-// WebSocket
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 
 wss.on('connection', (ws) => {
-  if (players.size >= MAX_PLAYERS) {
-    ws.close(1000, 'Servidor lleno');
-    return;
-  }
-  const playerId = nextId++;
-  const color = `hsl(${Math.random() * 360}, 70%, 60%)`;
+  if (players.size >= MAX_PLAYERS) { ws.close(); return; }
+  const id = nextId++;
+  const color = `hsl(${id * 50 % 360}, 70%, 60%)`;
   const player = {
-    id: playerId,
-    x: (Math.random() - 0.5) * WORLD_WIDTH * 0.5,
-    y: (Math.random() - 0.5) * WORLD_HEIGHT * 0.5,
-    angle: 0,
-    health: 100,
-    color,
-    shield: 0,
-    speedBoost: 0,
-    multishot: 0,
-    lastShot: 0,
-    alive: true
+    id, name: `Player${id}`, x: 0, y: 0, angle: 0,
+    health: 100, maxHealth: 100, shield: 0, maxShield: 5,
+    alive: true, score: 0,
+    color, speedBoost: 0, multishot: 0, laserBeam: 0,
+    invisible: false, teleport: false, mines: 0,
+    invulnerable: 0,
+    weapon: 'laser', // arma actual
+    kills: 0, deaths: 0
   };
   players.set(ws, player);
-
-  // Enviar ID y estado inicial
-  ws.send(JSON.stringify({ type: 'init', id: playerId, color, worldSize: { w: WORLD_WIDTH, h: WORLD_HEIGHT } }));
-  // Enviar todos los jugadores
+  ws.send(JSON.stringify({ type:'init', id, color, worldSize:{w:WORLD_W,h:WORLD_H} }));
   broadcastGameState();
 
   ws.on('message', (data) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'input') {
-      handlePlayerInput(ws, msg);
+    if (msg.type === 'input') handleInput(ws, msg);
+    if (msg.type === 'chat') {
+      chatMessages.push({name: player.name, text: msg.text, time: Date.now()});
+      if (chatMessages.length > 20) chatMessages.shift();
+      broadcast({ type:'chat', messages: chatMessages });
     }
+    if (msg.type === 'changeWeapon') player.weapon = msg.weapon;
   });
 
   ws.on('close', () => {
@@ -186,47 +238,92 @@ wss.on('connection', (ws) => {
   });
 });
 
+function handleInput(ws, input) {
+  const p = players.get(ws);
+  if (!p || !p.alive) return;
+  const speed = 4 + (p.speedBoost > 0 ? 3 : 0);
+  if (input.keys.w) p.y -= speed;
+  if (input.keys.s) p.y += speed;
+  if (input.keys.a) p.x -= speed;
+  if (input.keys.d) p.x += speed;
+  p.angle = input.mouseAngle;
+  p.x = Math.max(-WORLD_W/2, Math.min(WORLD_W/2, p.x));
+  p.y = Math.max(-WORLD_H/2, Math.min(WORLD_H/2, p.y));
+
+  if (p.invulnerable > 0) p.invulnerable--;
+
+  // Teleport
+  if (p.teleport && input.teleport) {
+    p.x = input.mouseWorldX;
+    p.y = input.mouseWorldY;
+    p.teleport = false;
+  }
+
+  // Disparo
+  if (input.shoot && Date.now() - (p.lastShot||0) > 200) {
+    p.lastShot = Date.now();
+    const weapon = p.weapon || 'laser';
+    switch(weapon) {
+      case 'laser':
+        bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle, speed:8, damage:10, ownerId:p.id });
+        break;
+      case 'shotgun':
+        for (let i=-2; i<=2; i++) {
+          bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle+i*0.15, speed:7, damage:8, ownerId:p.id });
+        }
+        break;
+      case 'rocket':
+        bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle, speed:5, damage:30, ownerId:p.id });
+        break;
+      case 'sniper':
+        bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle, speed:15, damage:25, ownerId:p.id });
+        break;
+      case 'mine':
+        if (p.mines > 0) {
+          mines.push({ id:Math.random().toString(36), x:p.x, y:p.y, ownerId:p.id });
+          p.mines--;
+        }
+        break;
+    }
+    if (p.multishot > 0 && weapon !== 'shotgun') {
+      bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle+0.2, speed:8, damage:10, ownerId:p.id });
+      bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle-0.2, speed:8, damage:10, ownerId:p.id });
+    }
+    if (p.laserBeam > 0) {
+      bullets.push({ id:Math.random().toString(36), x:p.x, y:p.y, angle:p.angle, speed:20, damage:15, ownerId:p.id });
+    }
+  }
+
+  if (p.speedBoost > 0) p.speedBoost--;
+  if (p.multishot > 0) p.multishot--;
+  if (p.laserBeam > 0) p.laserBeam--;
+  if (p.invisible > 0) p.invisible--;
+}
+
 function broadcastGameState() {
   const state = {
     type: 'gameState',
     players: Array.from(players.values()).map(p => ({
-      id: p.id,
-      x: p.x,
-      y: p.y,
-      angle: p.angle,
-      health: p.health,
-      color: p.color,
-      shield: p.shield,
-      alive: p.alive,
-      speedBoost: p.speedBoost > 0,
-      multishot: p.multishot > 0
+      id: p.id, name: p.name, x: p.x, y: p.y, angle: p.angle,
+      health: p.health, maxHealth: p.maxHealth, shield: p.shield,
+      alive: p.alive, color: p.color, score: p.score,
+      invisible: p.invisible > 0, weapon: p.weapon
     })),
-    bullets: bullets.map(b => ({ x: b.x, y: b.y, angle: b.angle })),
-    powerUps: powerUps.map(p => ({ id: p.id, x: p.x, y: p.y, type: p.type }))
+    bullets, mines, powerUps, obstacles,
+    gameMode, chatMessages: chatMessages.slice(-5)
   };
   broadcast(state);
 }
 
 function broadcast(msg) {
   const data = JSON.stringify(msg);
-  wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) client.send(data);
-  });
+  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(data); });
 }
 
 setInterval(() => {
   update();
-  // Revivir jugadores muertos automáticamente después de 3 seg (simplificado: lo hacemos en el update)
-  for (let [ws, player] of players) {
-    if (!player.alive) {
-      player.respawnTimer = (player.respawnTimer || 0) + 1;
-      if (player.respawnTimer > 180) { // 3 segundos
-        respawnPlayer(player);
-        player.respawnTimer = 0;
-      }
-    }
-  }
   broadcastGameState();
-}, TICK_RATE);
+}, TICK);
 
-console.log('Space Arena server running');
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log('Space Arena Ultra en puerto', PORT));
